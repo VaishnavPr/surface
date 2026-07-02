@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 # agg — helpers for Guardicore aggregator access (SaaS/tsh + thin envs)
-# Commands: agg-ssh, agg-logs, agg-grep, agg-check-upgrade, agg-j
+# Commands: agg-ssh, agg-logs, agg-grep, agg-check-upgrade, agg-j, agg-dev
 
 _AGG_LOGS_DIR="/var/log/guardicore"
 _AGG_CONTROLLER_LOG="aggregator.controllerserver.log"
@@ -249,11 +249,141 @@ agg-j() {
     _agg_pick_env "Run j command — pick aggregator env" || return 1
   fi
 
+  local jcmd
   if [[ $# -eq 0 ]]; then
-    echo "Usage: agg-j [tsh|thin] [id] <j-command> [args]" >&2
+    jcmd=$(printf \
+      'get-agent-info\nget-agent-status\ncreate-processes-info-snapshot {"flags": 40}\nquery-processes-info {"max-processes": 100}\nget-agent-config\nget-network-topology\nother (type manually)' \
+      | fzf --header="$(_agg_label $_AGG_TYPE $_AGG_ID) — pick j command" --height=12 --no-info) || return 1
+    if [[ "$jcmd" == "other (type manually)" ]]; then
+      echo -n "j command: " && read -r jcmd </dev/tty
+      [[ -z "$jcmd" ]] && return 1
+    fi
+  else
+    jcmd="$*"
+  fi
+
+  echo "Running: j $jcmd on $(_agg_label $_AGG_TYPE $_AGG_ID)..."
+  _agg_run "$_AGG_TYPE" "$_AGG_ID" "j $jcmd"
+}
+
+# ── agg-dev helpers ───────────────────────────────────────────────────────────
+_AGG_DEV_DIR="$HOME/.local/share/surface/aggr-dev"
+_AGG_SERVICES_DB="$_AGG_DEV_DIR/services.db"
+
+_agg_services_cache_load() {
+  sqlite3 "$_AGG_SERVICES_DB" \
+    "SELECT services FROM services_cache WHERE realm_id='$1' LIMIT 1;" 2>/dev/null
+}
+
+_agg_services_cache_age() {
+  local saved_at now diff
+  saved_at=$(sqlite3 "$_AGG_SERVICES_DB" \
+    "SELECT saved_at FROM services_cache WHERE realm_id='$1' LIMIT 1;" 2>/dev/null)
+  [[ -z "$saved_at" ]] && return 1
+  now=$(date +%s); diff=$(( now - saved_at ))
+  if   (( diff <    60 )); then echo "${diff}s ago"
+  elif (( diff <  3600 )); then echo "$((diff/60))m ago"
+  elif (( diff < 86400 )); then echo "$((diff/3600))h ago"
+  else                          echo "$((diff/86400))d ago"
+  fi
+}
+
+# ── agg-dev — sync local aggregator code to a SaaS realm via aggr-dev-cli ────
+
+agg-dev() {
+  if [[ "$1" == "--help" ]]; then
+    echo "  agg-dev    Sync local aggregator code to a SaaS realm aggregator"
+    echo ""
+    echo "  Requires: aggr-dev-cli, rsync >2.6.9"
+    echo "  SSH key is fetched automatically from realm data."
+    echo "  Keys stored in $_AGG_DEV_DIR/keys/  configs in $_AGG_DEV_DIR/configs/"
+    echo "  Ctrl+C stops syncing and restores compiled files on the remote."
+    return
+  fi
+
+  if ! command -v aggr-dev-cli &>/dev/null; then
+    echo "aggr-dev-cli not found. Install it with uv (see Confluence: Remote Aggregator code updates)." >&2
     return 1
   fi
 
-  echo "Running: j $* on $(_agg_label $_AGG_TYPE $_AGG_ID)..."
-  _agg_run "$_AGG_TYPE" "$_AGG_ID" "j $*"
+  mkdir -p "$_AGG_DEV_DIR/keys" "$_AGG_DEV_DIR/configs"
+
+  # 1. Pick realm
+  local realm_id
+  realm_id=$(_dp_pick_realm "agg-dev — pick realm") || return 1
+
+  # 2. Extract aggregator IP + SSH key from list cache
+  # (ssh_key only present in realms list response, not realms get)
+  local vm_json
+  vm_json=$(agg-vm-info.py "$realm_id" 2>/dev/null)
+
+  if [[ -z "$vm_json" ]]; then
+    echo "Refreshing realm list..."
+    dp-realm-refresh.py 2>/dev/null
+    vm_json=$(agg-vm-info.py "$realm_id" 2>/dev/null)
+  fi
+
+  local agg_ip ssh_key_content
+  agg_ip=$(printf '%s' "$vm_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['ip'])" 2>/dev/null)
+  ssh_key_content=$(printf '%s' "$vm_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['ssh_key'])" 2>/dev/null)
+
+  if [[ -z "$agg_ip" || -z "$ssh_key_content" ]]; then
+    echo "No aggregator VM found on this realm. Deploy one first." >&2
+    return 1
+  fi
+
+  # Save SSH key (reuse if already exists for this realm)
+  local ssh_key="$_AGG_DEV_DIR/keys/${realm_id}.pem"
+  echo "$ssh_key_content" > "$ssh_key"
+  chmod 600 "$ssh_key"
+
+  echo "  Aggregator:  $agg_ip"
+  echo "  SSH key:     $ssh_key"
+
+  # 3. Pick services to restart (cached, Ctrl-R to refresh)
+  echo ""
+  local services_lines age svc_header
+  age=$(_agg_services_cache_age "$realm_id" 2>/dev/null)
+  if [[ -n "$age" ]]; then
+    services_lines=$(_agg_services_cache_load "$realm_id")
+    svc_header="Services  [cached $age · Ctrl-R to refresh]  Tab to multi-select"
+  else
+    echo "Fetching services from aggregator (via tsh)..."
+    services_lines=$(agg-services-refresh.py "$realm_id" 2>/dev/null)
+    svc_header="Services  [live · Ctrl-R to refresh]  Tab to multi-select"
+  fi
+
+  if [[ -z "$services_lines" ]]; then
+    echo -n "Could not fetch services. Enter manually (comma-separated): " && read -r services </dev/tty
+  else
+    local _svc_refresh="change-header(Services  [⟳ Refreshing…])+reload(agg-services-refresh.py $realm_id)+change-header(Services  [✓ Refreshed · Ctrl-R to refresh again]  Tab to multi-select)"
+    services=$(printf '%s' "$services_lines" | fzf \
+      --multi \
+      --header="$svc_header" \
+      --bind="ctrl-r:$_svc_refresh" \
+      "${_DP_FZF_COLORS[@]}" \
+      | awk '{print $1}' | tr '\n' ',' | sed 's/,$//') || return 1
+  fi
+  [[ -z "$services" ]] && echo "No services selected." && return 1
+
+  # 4. Generate config
+  # services is comma-separated; split to positional args for create-config
+  local config_file="$_AGG_DEV_DIR/configs/${realm_id}.yaml"
+  local -a svc_args
+  svc_args=(${(s:,:)services})
+  echo ""
+  echo "Generating config..."
+  aggr-dev-cli create-config \
+    -a "$agg_ip" \
+    -i "$ssh_key" \
+    -gp "$_GC_DIR" \
+    --output "$config_file" \
+    --overwrite \
+    "${svc_args[@]}" || { echo "Config generation failed." >&2; return 1; }
+
+  # 5. Start syncing
+  echo ""
+  echo "Starting sync (Ctrl+C to stop and restore compiled files)..."
+  echo ""
+  aggr-dev-cli dev --config-file-path "$config_file"
 }

@@ -227,15 +227,18 @@ The default shared password is used if `~/.config/gc-thin.env` is absent. Set `T
 
 ### Aggregator (`agg-*`)
 
-Requires: `sshpass` (thin), or `tsh`+`kubectl` (SaaS)
+Requires: `sshpass` (thin), or `tsh` (SaaS)
 
 ```
-agg-ssh <num>              SSH into aggregator for thin-<num>
-agg-logs <num>             Tail aggregator logs
-agg-grep <num> <pattern>   Grep aggregator logs
-agg-check-upgrade <num>    Check aggregator upgrade status
-agg-j <num>                Jump: SSH then tail controller log
+agg-ssh              SSH into aggregator (fzf pick: SaaS realm or thin env)
+agg-logs             Tail aggregator logs with noise filtered
+agg-grep             Grep logs including rotated .gz files
+agg-check-upgrade    Trace upgrade activity by job or agent UUID
+agg-j                Run a j command on an agent (fzf command picker)
+agg-dev              Sync local aggregator code to a SaaS realm (aggr-dev-cli)
 ```
+
+`agg-dev` requires `aggr-dev-cli` and `rsync >2.6.9`. It fetches the SSH key from realm data automatically and stores it in `~/.local/share/surface/aggr-dev/keys/`. SaaS only.
 
 ### Jira (`jira-*`)
 
