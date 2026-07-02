@@ -589,6 +589,7 @@ dp-connect() {
   echo "  dp-dev         — start devspace dev (pick services)"
   echo "  dp-logs        — tail pod logs (pick service)"
   echo "  dp-mgmtctl     — run mgmtctl command"
+  echo "  dp-ff          — browse & toggle feature flags"
   echo "  dp-config-gen  — generate devspace.yaml for selected services"
   echo ""
 }
@@ -674,6 +675,251 @@ dp-mgmtctl() {
   fi
 
   (cd "$_GC_DIR" && devspace run gc-mgmtctl "$@")
+}
+
+# ── internal: find script-server pod and run mgmtctl ────────────────────────
+_dp_mgmtctl_exec() {
+  local pod
+  pod=$(kubectl get pods -o name 2>/dev/null \
+    | grep '/script-server-' | grep -v 'rest' | head -1 | sed 's|pod/||')
+  if [[ -z "$pod" ]]; then
+    echo "No script-server pod found in current namespace." >&2
+    return 1
+  fi
+  kubectl exec "$pod" -- bash -c \
+    "cd /var/lib/guardicore/management && python scripts/mgmtctl/main.pyc $* 2>&1" \
+    | grep -vE 'Initializing STATSD|Using STATSD|Initializing logger|Creating a new Consul|\[.*:INFO\]|\[.*:ERROR\]|\[.*:WARNING\]|^\s*$'
+}
+
+_DP_FF_CACHE="$HOME/.local/share/surface/dp-ff"
+
+_dp_ff_pick_env() {
+  local current_ns current_ctx
+  current_ns=$(kubectl config view --minify -o jsonpath='{..namespace}' 2>/dev/null)
+  current_ctx=$(kubectl config current-context 2>/dev/null | sed 's/.*\///')
+
+  local choice
+  choice=$(printf "Use current env  [${current_ns:-none}]\nPick a different realm" | fzf \
+    --header="  ctx: ${current_ctx:-?}   ns: ${current_ns:-not connected}" \
+    --height=7 --no-info) || return 1
+
+  [[ "$choice" == "Pick a different realm" ]] && { dp-connect || return 1; }
+}
+
+_dp_ff_cache_age() {
+  local ts_file="$_DP_FF_CACHE/$1/timestamp"
+  [[ -f "$ts_file" ]] || return 1
+  local ts now diff
+  ts=$(cat "$ts_file")
+  now=$(date +%s)
+  diff=$(( now - ts ))
+  if   (( diff <    60 )); then echo "${diff}s ago"
+  elif (( diff <  3600 )); then echo "$((diff/60))m ago"
+  elif (( diff < 86400 )); then echo "$((diff/3600))h ago"
+  else                          echo "$((diff/86400))d ago"
+  fi
+}
+
+_dp_ff_cache_save() {
+  local ns="$1"
+  local dir="$_DP_FF_CACHE/$ns"
+  mkdir -p "$dir"
+  printf '%s' "$2" > "$dir/conf.txt"
+  printf '%s' "$3" > "$dir/ff.json"
+  date +%s          > "$dir/timestamp"
+}
+
+_dp_ff_cache_bust() {
+  local ns="$1"
+  rm -f "$_DP_FF_CACHE/$ns/timestamp"
+}
+
+_dp_ff_fetch() {
+  # Sets conf_raw and ff_raw in caller's scope; saves to cache
+  local ns="$1"
+  echo "Fetching conf + feature flags from cluster..."
+  conf_raw=$(_dp_mgmtctl_exec "dump_conf" 2>/dev/null)
+  ff_raw=$(_dp_mgmtctl_exec "get_feature_flags" 2>/dev/null)
+  if [[ -z "$conf_raw" && -z "$ff_raw" ]]; then
+    echo "No output — is the namespace connected? (run dp-connect first)" >&2
+    return 1
+  fi
+  _dp_ff_cache_save "$ns" "$conf_raw" "$ff_raw"
+  echo "Cached for $ns."
+}
+
+_dp_ff_ask_cache() {
+  # Sets conf_raw and ff_raw in caller's scope using cache or fetch
+  local ns="$1"
+  local dir="$_DP_FF_CACHE/$ns"
+
+  if [[ -f "$dir/timestamp" ]]; then
+    local age
+    age=$(_dp_ff_cache_age "$ns")
+    local choice
+    choice=$(printf "Use cached  [$age]\nFetch fresh from cluster" | fzf \
+      --header="  ns: $ns" \
+      --height=6 --no-info) || return 1
+
+    if [[ "$choice" == Use\ cached* ]]; then
+      conf_raw=$(cat "$dir/conf.txt")
+      ff_raw=$(cat "$dir/ff.json")
+      echo "Using cache ($age)."
+      return 0
+    fi
+  fi
+
+  _dp_ff_fetch "$ns"
+}
+
+_dp_ff_build_lines() {
+  python3 -c "
+import json, sys, re
+
+RED    = '\033[31m'
+GREEN  = '\033[32m'
+YELLOW = '\033[33m'
+DIM    = '\033[2m'
+RESET  = '\033[0m'
+
+conf_raw, ff_raw = sys.argv[1], sys.argv[2]
+
+def color_val(v):
+    vs = str(v)
+    if vs.lower() == 'true':  return GREEN  + vs + RESET
+    if vs.lower() == 'false': return RED    + vs + RESET
+    return YELLOW + vs + RESET
+
+lines = []
+
+# conf (INI)
+current_group = ''
+for line in conf_raw.splitlines():
+    m = re.match(r'^\[(.+)\]', line)
+    if m: current_group = m.group(1); continue
+    m = re.match(r'^(\S+)\s*=\s*(.+)', line)
+    if m and current_group:
+        opt, val = m.group(1), m.group(2).strip()
+        disp = f'{DIM}[conf]{RESET}  {current_group:<22} {opt:<42} = {color_val(val)}'
+        lines.append(f'conf|{current_group}|{opt}|{val}|{disp}')
+
+# feature flags (JSON)
+if ff_raw:
+    try:
+        start = ff_raw.index('{')
+        data = json.loads(ff_raw[start:])
+        for group, opts in sorted(data.items()):
+            if not isinstance(opts, dict): continue
+            for opt, val in sorted(opts.items()):
+                disp = f'{DIM}[ff]  {RESET}  {group:<22} {opt:<42} = {color_val(val)}'
+                lines.append(f'ff|{group}|{opt}|{val}|{disp}')
+    except: pass
+
+print('\n'.join(lines))
+" "$1" "$2"
+}
+
+# ── dp-ff — feature flag + conf browser for SaaS devportal realms ───────────
+dp-ff() {
+  if [[ "$1" == "--help" ]]; then
+    echo "  dp-ff                        Browse & toggle flags/conf (interactive, cached)"
+    echo "  dp-ff get <group> <option>   Get a specific conf value (live)"
+    echo "  dp-ff set <group> <opt> <v>  Set a conf option (live, clears cache)"
+    echo "  dp-ff refresh                Force re-fetch and update cache"
+    echo "  dp-ff list                   Dump raw conf + feature flags (no fzf)"
+    return
+  fi
+
+  local subcmd="${1:-}"
+
+  case "$subcmd" in
+    get)
+      local group="$2" option="$3"
+      [[ -z "$group" || -z "$option" ]] && echo "Usage: dp-ff get <group> <option>" && return 1
+      _dp_ff_pick_env || return 1
+      _dp_mgmtctl_exec "get_conf --group $group --option $option"
+      ;;
+
+    set)
+      local group="$2" option="$3" value="$4"
+      [[ -z "$group" || -z "$option" || -z "$value" ]] \
+        && echo "Usage: dp-ff set <group> <option> <value>" && return 1
+      _dp_ff_pick_env || return 1
+      local ns
+      ns=$(kubectl config view --minify -o jsonpath='{..namespace}' 2>/dev/null)
+      echo "Setting $group.$option = $value..."
+      _dp_mgmtctl_exec "set_conf --group $group --option $option --value $value" \
+        && _dp_ff_cache_bust "$ns" && echo "Cache cleared for $ns."
+      ;;
+
+    refresh)
+      _dp_ff_pick_env || return 1
+      local ns conf_raw ff_raw
+      ns=$(kubectl config view --minify -o jsonpath='{..namespace}' 2>/dev/null)
+      _dp_ff_fetch "$ns"
+      ;;
+
+    list)
+      _dp_ff_pick_env || return 1
+      local ns conf_raw ff_raw
+      ns=$(kubectl config view --minify -o jsonpath='{..namespace}' 2>/dev/null)
+      _dp_ff_ask_cache "$ns" || return 1
+      echo "=== conf ===" && echo "$conf_raw"
+      echo "" && echo "=== feature flags ===" && echo "$ff_raw"
+      ;;
+
+    "")
+      _dp_ff_pick_env || return 1
+
+      local ns
+      ns=$(kubectl config view --minify -o jsonpath='{..namespace}' 2>/dev/null)
+
+      local conf_raw ff_raw
+      _dp_ff_ask_cache "$ns" || return 1
+
+      local lines
+      lines=$(_dp_ff_build_lines "$conf_raw" "$ff_raw")
+      [[ -z "$lines" ]] && echo "Could not parse output." && return 1
+
+      local selected
+      selected=$(echo "$lines" | fzf \
+        --delimiter='|' \
+        --with-nth=5 \
+        --ansi \
+        --header="$ns — conf + feature flags  (Enter to set, Ctrl-C to exit)" \
+        --preview='printf "type:   {1}\ngroup:  {2}\noption: {3}\nvalue:  {4}"' \
+        --preview-window=down:6:wrap) || return 0
+
+      local ftype group option current_val
+      ftype=$(echo "$selected"      | cut -d'|' -f1)
+      group=$(echo "$selected"      | cut -d'|' -f2)
+      option=$(echo "$selected"     | cut -d'|' -f3)
+      current_val=$(echo "$selected"| cut -d'|' -f4)
+
+      echo ""
+      echo "  [$ftype]  $group.$option = $current_val"
+      echo ""
+
+      local new_val
+      if   [[ "${current_val:l}" == "true"  ]]; then new_val="False"
+      elif [[ "${current_val:l}" == "false" ]]; then new_val="True"
+      else
+        echo -n "  New value [$current_val]: " && read -r new_val </dev/tty
+        [[ -z "$new_val" ]] && echo "Aborted." && return 0
+      fi
+
+      echo "  $group.$option  →  $new_val"
+      echo -n "  Confirm? [y/N]: " && read -r confirm </dev/tty
+      [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "Aborted." && return 0
+
+      echo "Setting..."
+      _dp_mgmtctl_exec "set_conf --group $group --option $option --value $new_val" || return 1
+
+      # Update cache: bust and re-fetch so next open reflects the change
+      echo "Refreshing cache..."
+      _dp_ff_fetch "$ns"
+      ;;
+  esac
 }
 
 # ── dp-config-gen — generate devspace.yaml with fzf service picker ────────────
