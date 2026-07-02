@@ -7,9 +7,21 @@ _DP="devportal-cli"
 _GC_DIR="$HOME/Documents/guardicore"
 _TELEPORT_PROXY="teleport.saas.guardicore.com:443"
 
+# ── internal: strip devportal-cli preamble lines, return only JSON ───────────
+_dp_json() {
+  python3 -c "
+import sys
+raw = sys.stdin.read()
+for i, c in enumerate(raw):
+    if c in '[{':
+        print(raw[i:])
+        break
+"
+}
+
 # ── internal: format realms for fzf ─────────────────────────────────────────
 _dp_realm_lines() {
-  "$_DP" realms list --json 2>/dev/null | python3 -c "
+  "$_DP" realms list --json 2>/dev/null | _dp_json | python3 -c "
 import json, sys, datetime
 
 def expiry(s):
@@ -59,7 +71,7 @@ for r in data:
 
 # ── internal: format legacy envs for fzf ────────────────────────────────────
 _dp_env_lines() {
-  "$_DP" legacy-envs list --json 2>/dev/null | python3 -c "
+  "$_DP" legacy-envs list --json 2>/dev/null | _dp_json | python3 -c "
 import json, sys, datetime
 
 def expiry(s):
@@ -312,7 +324,7 @@ dp-open() {
 
   id=$(echo "$line" | cut -d'|' -f1)
 
-  ui_url=$("$_DP" realms get "$id" --json 2>/dev/null | python3 -c "
+  ui_url=$("$_DP" realms get "$id" --json 2>/dev/null | _dp_json | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 for r in data.get('resources', []):
@@ -364,7 +376,7 @@ dp-requests() {
     echo "  dp-requests    Browse recent devportal request history"
     return
   fi
-  "$_DP" requests list --json 2>/dev/null | python3 -c "
+  "$_DP" requests list --json 2>/dev/null | _dp_json | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 for r in data:
@@ -386,7 +398,7 @@ dp-info() {
   local realm_id
   realm_id=$(_dp_pick_realm "Show deployment info") || return 1
 
-  "$_DP" realms get "$realm_id" --json 2>/dev/null | python3 -c "
+  "$_DP" realms get "$realm_id" --json 2>/dev/null | _dp_json | python3 -c "
 import json, sys, datetime
 
 def expiry(s):
@@ -494,7 +506,7 @@ if deploys:
 # ── internal: extract cluster + namespace from a realm ID ─────────────────────
 _dp_realm_kube_info() {
   local realm_id="$1"
-  "$_DP" realms get "$realm_id" --json 2>/dev/null | python3 -c "
+  "$_DP" realms get "$realm_id" --json 2>/dev/null | _dp_json | python3 -c "
 import json, sys
 
 data = json.load(sys.stdin)

@@ -38,7 +38,11 @@ def expiry(s):
     if days < 0:  return 'EXPIRED'
     return f'exp:{days}d'
 
-data = json.load(sys.stdin)
+raw = sys.stdin.read()
+for i, c in enumerate(raw):
+    if c in '[{':
+        raw = raw[i:]; break
+data = json.loads(raw)
 data.sort(key=lambda e: e.get('updated_at') or '', reverse=True)
 for e in data:
     name = e.get('name', '')
