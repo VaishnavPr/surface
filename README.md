@@ -11,6 +11,7 @@ zsh/              Zsh function files — source these from your shell
   jenkins.zsh     jenkins-jobs, jenkins-trigger, jenkins-watch (fzf-powered)
   devportal.zsh   dp-realms, dp-connect, dp-deploy, dp-info, dp-extend ...
   thin.zsh        thin-ssh, thin-ff, thin-logs, thin-log-search
+  circleci.zsh    ci-pipelines, ci-pr, ci-diagnose, ci-logs, ci-open
 ```
 
 ## Python CLI — surface
@@ -69,6 +70,7 @@ source ~/Documents/surface/zsh/jira.zsh
 source ~/Documents/surface/zsh/jenkins.zsh
 source ~/Documents/surface/zsh/devportal.zsh
 source ~/Documents/surface/zsh/thin.zsh
+source ~/Documents/surface/zsh/circleci.zsh
 ```
 
 Once the daemon is running, profile commands are available directly:
@@ -90,6 +92,12 @@ dp-deploy --new    → create realm + deploy SaaS Centra
 dp-extend          → extend lease
 dp-dev             → devspace dev with fzf service picker
 dp-mgmtctl         → gc-mgmtctl inside script-server pod
+
+ci-pipelines       → browse your recent pipelines (fzf → workflows → jobs → logs)
+ci-pr <pr>         → find pipeline for a PR, drill into workflows
+ci-diagnose <pr>   → automated: PR → failed jobs → print failure logs
+ci-logs <job>      → fetch and print failed step output
+ci-open [pr]       → open pipeline in browser
 ```
 
 ## Requirements
