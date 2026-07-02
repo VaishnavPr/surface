@@ -1,109 +1,280 @@
 # Surface
 
-Developer CLI and shell integration for Guardicore work — Jenkins, Jira, dev portal, and profile switching.
+Developer CLI and shell integration for Guardicore work — Jenkins, Jira, dev portal, CircleCI, thin envs, and aggregator access.
 
-## What's in here
+## Contents
 
 ```
-surface/          Python CLI package (click + rich + httpx + SQLite)
-zsh/              Zsh function files — source these from your shell
-  jira.zsh        jira-tickets, jira-view, jira-start (AI branch suggestions)
-  jenkins.zsh     jenkins-jobs, jenkins-trigger, jenkins-watch (fzf-powered)
-  devportal.zsh   dp-realms, dp-connect, dp-deploy, dp-info, dp-extend ...
+surface/          Python CLI (click + rich + httpx + SQLite) — daemon, profiles, caching
+zsh/
+  jira.zsh        jira-tickets, jira-view, jira-start
+  jenkins.zsh     jenkins-jobs, jenkins-trigger, jenkins-watch
+  devportal.zsh   dp-realms, dp-new, dp-deploy, dp-connect, dp-info, dp-extend, dp-ff …
   thin.zsh        thin-ssh, thin-ff, thin-logs, thin-log-search
   circleci.zsh    ci-pipelines, ci-pr, ci-diagnose, ci-logs, ci-open
+  agg.zsh         agg-ssh, agg-logs, agg-grep, agg-check-upgrade
 ```
 
-## Python CLI — surface
+---
 
-SQLite-backed cache and profile manager. Lives at `~/.local/share/surface/surface.db`.
+## Prerequisites
+
+### Tools
+
+| Tool | Install | Used by |
+|------|---------|---------|
+| `fzf` | `brew install fzf` | all interactive pickers |
+| `sshpass` | `brew install hudochenkov/sshpass/sshpass` | `thin-ssh`, `agg-ssh` |
+| `python3` ≥ 3.11 | ships with macOS / `brew install python` | parsing CLI output |
+| `jq` | `brew install jq` | JSON formatting |
+| `sqlite3` | ships with macOS | `dp-ff` cache |
+| `devportal-cli` | internal install (see below) | all `dp-*` commands |
+| `tsh` (Teleport) | `brew install teleport` | `dp-connect`, `agg-ssh` |
+| `kubectl` | `brew install kubectl` | `dp-connect`, `dp-dev`, `dp-logs` |
+| `devspace` | `brew install devspace` | `dp-dev`, `dp-logs`, `dp-config-gen` |
+| `uv` | `brew install uv` | `dp-dev`, `dp-config-gen` |
+
+### devportal-cli
+
+Install from the internal registry, then authenticate:
 
 ```bash
-# Install
-cd surface && python3 -m venv .venv && .venv/bin/pip install -e .
+# Install (ask your team for the exact install command)
+pip install devportal-cli
 
-# Profiles
-surface profile create work --jenkins prod --jira-project GC
-surface profile create personal
-surface profile set work
-
-# Daemon (writes ~/.local/share/surface/shell.zsh, auto-restarts on profile change)
-surface daemon start
-surface daemon status
-
-# Jenkins cache
-surface jenkins jobs
-surface jenkins jobs --refresh
-
-# Jira cache
-surface jira tickets --project GC
-
-# Servers
-surface servers list
-surface servers add my-server 1.2.3.4 --user root --port 222 --profile work
+# Authenticate — stores credentials at ~/.devportal-cli/credentials-prod.json
+devportal-cli auth login
 ```
+
+### macOS: iTerm2 Full Disk Access
+
+The zsh files live under `~/Documents/`. macOS blocks shell sourcing from that path unless your terminal has **Full Disk Access**.
+
+**System Settings → Privacy & Security → Full Disk Access** → enable iTerm (or your terminal app). Open a new window after toggling.
+
+---
+
+## Credentials
+
+Each zsh module reads a credentials file from `~/.config/`. Create these files before using the corresponding commands.
+
+### Jira — `~/.config/gc-jira.env`
+
+```bash
+JIRA_BASE_URL="https://guardicore.atlassian.net"
+JIRA_EMAIL="you@akamai.com"
+JIRA_TOKEN="<Atlassian API token>"
+```
+
+Get your token at: `https://id.atlassian.com/manage-profile/security/api-tokens`
+
+### Jenkins — `~/.config/gc-jenkins.env`
+
+```bash
+JENKINS_URL="https://jenkins.guardi"
+JENKINS_TESTING_URL="https://testingjenkins.guardi"
+JENKINS_USER="firstname.lastname"
+JENKINS_TOKEN="<Jenkins API token>"
+```
+
+Get your token: Jenkins → your user → Configure → API Token.
+
+### CircleCI — `~/.config/gc-circleci.env`
+
+```bash
+CIRCLECI_TOKEN="<CircleCI personal API token>"
+```
+
+Get your token: `https://app.circleci.com/settings/user/tokens`
+
+### GitHub — `~/.config/gc-github.env`
+
+```bash
+GITHUB_TOKEN="<GitHub personal access token>"
+GITHUB_REPO="guardicore/guardicore"
+```
+
+Get your token: GitHub → Settings → Developer settings → Personal access tokens. Needs `repo` scope.
+
+---
+
+## Installation
+
+```bash
+cd ~/Documents/surface
+python3 -m venv .venv
+.venv/bin/pip install -e .
+```
+
+Start the daemon (generates `~/.local/share/surface/shell.zsh` which the precmd hook re-sources automatically):
+
+```bash
+.venv/bin/surface daemon start
+.venv/bin/surface daemon status
+```
+
+---
 
 ## Shell integration
 
 Add to `~/.zshrc`:
 
 ```zsh
-# Surface daemon + precmd hook
+# ── surface shell integration ─────────────────────────────────────────────────
 _SURFACE_BIN="$HOME/Documents/surface/.venv/bin/surface"
+
 if [[ -x "$_SURFACE_BIN" ]]; then
-  "$_SURFACE_BIN" daemon status 2>/dev/null | grep -q Running || "$_SURFACE_BIN" daemon start &>/dev/null
+  if ! "$_SURFACE_BIN" daemon status 2>/dev/null | grep -q Running; then
+    "$_SURFACE_BIN" daemon start &>/dev/null
+  fi
+
   _SURFACE_SHELL="$HOME/.local/share/surface/shell.zsh"
   [[ -f "$_SURFACE_SHELL" ]] && source "$_SURFACE_SHELL"
-  _surface_shell_mtime=0
+
+  # Re-source on every prompt if shell.zsh changed (cheap stat check)
+  _surface_shell_mtime=$(stat -f %m "$_SURFACE_SHELL" 2>/dev/null || echo 0)
   _surface_precmd() {
-    local mtime=$(stat -f %m "$_SURFACE_SHELL" 2>/dev/null || echo 0)
+    local mtime
+    mtime=$(stat -f %m "$_SURFACE_SHELL" 2>/dev/null || echo 0)
     if [[ $mtime != $_surface_shell_mtime ]]; then
       _surface_shell_mtime=$mtime
       [[ -f "$_SURFACE_SHELL" ]] && source "$_SURFACE_SHELL"
     fi
   }
-  autoload -Uz add-zsh-hook && add-zsh-hook precmd _surface_precmd
+  autoload -Uz add-zsh-hook
+  add-zsh-hook precmd _surface_precmd
 fi
-
-# Zsh functions
-source ~/Documents/surface/zsh/jira.zsh
-source ~/Documents/surface/zsh/jenkins.zsh
-source ~/Documents/surface/zsh/devportal.zsh
-source ~/Documents/surface/zsh/thin.zsh
-source ~/Documents/surface/zsh/circleci.zsh
+# ─────────────────────────────────────────────────────────────────────────────
 ```
 
-Once the daemon is running, profile commands are available directly:
+The daemon writes the zsh function sources into `shell.zsh`; the precmd hook picks up changes live. The zsh files themselves are sourced from there — **no need to source them manually in `.zshrc`**.
+
+---
+
+## Commands
+
+### Dev portal (`dp-*`)
+
+Requires: `devportal-cli` authenticated, `fzf`, `python3`, `sqlite3`
 
 ```
-work-profile       → switches to work (opens Slack, Webex, switches git identity)
-personal-profile   → switches to personal
-profile-info       → shows active profile
-
-thin-ssh 160                         → SSH into thin-160 management
-thin-ff 71                           → browse & toggle feature flags on thin-71
-thin-ff 71 set access enabled true   → enable access flag directly
-thin-logs 160                        → tail logs (fzf log file picker)
-
-dp-realms          → browse all dev portal realms (version, branch, expiry inline)
-dp-info            → full info card (credentials, cluster, deploy history)
-dp-connect         → pick realm → tsh login → kubectl namespace set
-dp-deploy --new    → create realm + deploy SaaS Centra
-dp-extend          → extend lease
-dp-dev             → devspace dev with fzf service picker
-dp-mgmtctl         → gc-mgmtctl inside script-server pod
-
-ci-pipelines       → browse your recent pipelines (fzf → workflows → jobs → logs)
-ci-pr <pr>         → find pipeline for a PR, drill into workflows
-ci-diagnose <pr>   → automated: PR → failed jobs → print failure logs
-ci-logs <job>      → fetch and print failed step output
-ci-open [pr]       → open pipeline in browser
+dp-realms          Browse all your realms (version, branch, expiry inline)
+dp-envs            Browse legacy (thin) environments
+dp-new             Create a new realm; optionally deploy SaaS Centra to it
+dp-deploy          Deploy SaaS Centra to a realm (fzf pick, or --new to create first)
+dp-claim           Claim a pre-provisioned instant realm
+dp-info            Full info card — credentials, cluster, versions, deploy history
+dp-connect         Pick realm → tsh login → kubectl namespace set
+dp-extend          Extend realm or legacy env lease
+dp-terminate       Terminate a realm or legacy env (with confirmation)
+dp-transfer        Transfer ownership of a realm or legacy env
+dp-open            Open realm UI in browser
+dp-requests        Browse recent devportal request history
+dp-dev             devspace dev with fzf service picker
+dp-logs            Tail logs for a service (fzf pick)
+dp-mgmtctl         Run mgmtctl commands inside script-server pod
+dp-ff              Browse & toggle feature flags / conf (cached, interactive)
+dp-config-gen      Generate devspace.yaml for selected services
+dp-mongo           Interactive MongoDB browser (db → collection → documents)
 ```
 
-## Requirements
+`dp-connect` requires `tsh` and `kubectl`. `dp-dev`, `dp-logs`, `dp-config-gen` additionally require `devspace` and `uv` (run from `~/Documents/guardicore`).
 
-- `sshpass` — for thin env SSH (`brew install hudochenkov/sshpass/sshpass`)
-- `fzf` — for all interactive pickers (`brew install fzf`)
-- `devportal-cli` — dev portal access
-- `tsh` + `kubectl` — for SaaS realm connection
-- `devspace` — for code sync to SaaS pods
+### Thin envs (`thin-*`)
+
+Requires: `sshpass`, `devportal-cli` (for env list), `fzf`
+
+```
+thin-ssh <num>                     SSH into thin-<num> management node
+thin-ff <num>                      Browse & toggle feature flags on thin-<num>
+thin-ff <num> set <grp> <opt> <v>  Set a conf option directly
+thin-logs <num>                    Tail logs (fzf log file picker)
+thin-log-search <num> <pattern>    Search logs for a pattern
+thin-mgmtctl <num> <cmd>           Run mgmtctl command on thin-<num>
+thin-status <num>                  Quick health check
+```
+
+The thin env password is hardcoded in `thin.zsh` (`_THIN_PASS`).
+
+### Aggregator (`agg-*`)
+
+Requires: `sshpass` (thin), or `tsh`+`kubectl` (SaaS)
+
+```
+agg-ssh <num>              SSH into aggregator for thin-<num>
+agg-logs <num>             Tail aggregator logs
+agg-grep <num> <pattern>   Grep aggregator logs
+agg-check-upgrade <num>    Check aggregator upgrade status
+agg-j <num>                Jump: SSH then tail controller log
+```
+
+### Jira (`jira-*`)
+
+Requires: `~/.config/gc-jira.env`, `fzf`
+
+```
+jira-tickets           Browse your open tickets (fzf)
+jira-view <key>        View a ticket (GC-12345)
+jira-start             Pick a ticket and create a git branch for it
+```
+
+### Jenkins (`jenkins-*`)
+
+Requires: `~/.config/gc-jenkins.env`, `fzf`
+
+```
+jenkins-jobs           Browse jobs (fzf)
+jenkins-trigger <job>  Trigger a build
+jenkins-watch <job>    Watch a running build's console output
+```
+
+### CircleCI (`ci-*`)
+
+Requires: `~/.config/gc-circleci.env`, `fzf`
+
+```
+ci-pipelines           Browse your recent pipelines → workflows → jobs → logs
+ci-pr <pr-number>      Find pipeline for a PR, drill into workflows
+ci-diagnose <pr>       Auto: PR → failed jobs → print failure logs
+ci-logs <job-id>       Fetch and print failed step output
+ci-open [pr]           Open pipeline in browser
+```
+
+### Profiles
+
+After `surface daemon start`, the daemon injects profile-switch commands into the shell:
+
+```
+work-profile       Switch to work (git identity, tools)
+personal-profile   Switch to personal
+profile-info       Show active profile
+```
+
+---
+
+## surface CLI reference
+
+```bash
+# Profiles
+surface profile create work --jenkins prod --jira-project GC
+surface profile set work
+surface profile list
+
+# Daemon
+surface daemon start
+surface daemon stop
+surface daemon status
+
+# Jenkins job cache
+surface jenkins jobs
+surface jenkins jobs --refresh
+
+# Jira ticket cache
+surface jira tickets --project GC
+
+# Server inventory
+surface servers list
+surface servers add my-server 1.2.3.4 --user root --port 222 --profile work
+```
+
+Data is stored in `~/.local/share/surface/surface.db` (SQLite).

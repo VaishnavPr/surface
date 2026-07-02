@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 # devportal — fzf-powered wrappers around devportal-cli + devspace
-# Commands: dp-realms, dp-envs, dp-extend, dp-terminate, dp-deploy, dp-claim, dp-open, dp-transfer
+# Commands: dp-realms, dp-envs, dp-extend, dp-terminate, dp-new, dp-deploy, dp-claim, dp-open, dp-transfer
 #           dp-connect, dp-dev, dp-logs, dp-mgmtctl, dp-config-gen
 
 _DP="devportal-cli"
@@ -275,6 +275,8 @@ dp-deploy() {
     id=$("$_DP" realms create --id-only 2>/dev/null)
     [[ -z "$id" ]] && echo "Failed to create realm" && return 1
     echo "Created realm: $id"
+  elif [[ -n "$1" && "$1" != --* ]]; then
+    id="$1"
   else
     id=$(_dp_pick_realm "Deploy SaaS Centra — pick realm") || return 1
   fi
@@ -295,6 +297,50 @@ dp-deploy() {
     --git-ref "$git_ref" \
     --aggregator-cluster "$agg_cluster" \
     --watch
+}
+
+# ── dp-new — create a new realm ──────────────────────────────────────────────
+dp-new() {
+  if [[ "$1" == "--help" ]]; then
+    echo "  dp-new              Create a new realm (prompts for optional name + deploy)"
+    echo "  dp-new --deploy     Create and immediately deploy SaaS Centra to it"
+    return
+  fi
+
+  local deploy_after=0
+  [[ "$1" == "--deploy" ]] && deploy_after=1
+
+  echo -n "Realm name (leave blank for auto): " && read -r realm_name </dev/tty
+
+  local create_cmd=("$_DP" realms create --id-only)
+  [[ -n "$realm_name" ]] && create_cmd+=(--name "$realm_name")
+
+  echo "Creating realm..."
+  local id
+  id=$("${create_cmd[@]}" 2>/dev/null \
+    | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+    | tail -1)
+  if [[ -z "$id" ]]; then
+    echo "Failed to create realm — re-run to see the error:" >&2
+    "${create_cmd[@]}"
+    return 1
+  fi
+
+  echo ""
+  echo "  Created: $id"
+  [[ -n "$realm_name" ]] && echo "  Name:    $realm_name"
+  echo ""
+
+  if [[ $deploy_after -eq 1 ]]; then
+    dp-deploy "$id"
+    return
+  fi
+
+  local choice
+  choice=$(printf "Deploy SaaS Centra to it now\nJust created, exit" | fzf \
+    --header="Realm $id created" --height=6 --no-info) || return 0
+
+  [[ "$choice" == Deploy* ]] && dp-deploy "$id"
 }
 
 # ── dp-claim — claim an instant realm ────────────────────────────────────────
@@ -980,4 +1026,152 @@ dp-config-gen() {
   (cd "$_GC_DIR" && uv run devspace-config.py create "${services[@]}" $debug_flag --overwrite)
   echo ""
   echo "Done. Run 'dp-dev' to start devspace, or 'devspace dev' from $GC_DIR"
+}
+
+# ── dp-mongo — interactive MongoDB browser for SaaS devportal realms ─────────
+dp-mongo() {
+  if [[ "$1" == "--help" ]]; then
+    echo "  dp-mongo              Browse MongoDB interactively (db → collection → documents)"
+    echo "  dp-mongo <db>         Jump straight to a database's collections"
+    echo "  dp-mongo <db> <coll>  Jump straight to documents in a collection"
+    return
+  fi
+
+  local ns pod mongo_pass mongo_uri
+
+  _dp_ff_pick_env || return 1
+  ns=$(kubectl config view --minify -o jsonpath='{..namespace}' 2>/dev/null)
+  if [[ -z "$ns" ]]; then
+    echo "Not connected — run dp-connect first." >&2
+    return 1
+  fi
+
+  echo "Connecting to MongoDB in $ns..."
+
+  pod=$(kubectl get pod --no-headers 2>/dev/null | awk '/script-server/{print $1; exit}')
+  if [[ -z "$pod" ]]; then
+    echo "script-server pod not found. Available pods:" >&2
+    kubectl get pod --no-headers 2>/dev/null | awk '{print $1}' >&2
+    return 1
+  fi
+
+  mongo_pass=$(kubectl exec "$pod" -- python3 -c "
+import json
+conf = json.load(open('/etc/guardicore/guardicore_setup.conf'))
+print(conf['mongodb_user_passwords']['gc_mgmt'])
+" 2>/dev/null)
+
+  if [[ -z "$mongo_pass" ]]; then
+    echo "Could not read MongoDB password from script-server pod." >&2
+    return 1
+  fi
+
+  mongo_uri="mongodb://gc_mgmt:${mongo_pass}@mongodb-headless.${ns}.svc.cluster.local/guardicore?authSource=admin"
+
+  _dp_mongo_exec() {
+    kubectl exec "$pod" -- mongosh "$mongo_uri" --quiet --eval "$1" 2>/dev/null
+  }
+
+  # Pick database
+  local db="${1:-}"
+  if [[ -z "$db" ]]; then
+    db=$(_dp_mongo_exec "db.adminCommand('listDatabases').databases.map(d=>d.name).join('\n')" \
+      | fzf --header="$ns — select database" --height=15 --no-info) || return 0
+  fi
+
+  # Pick collection
+  local coll="${2:-}"
+  if [[ -z "$coll" ]]; then
+    coll=$(kubectl exec "$pod" -- mongosh \
+      "mongodb://gc_mgmt:${mongo_pass}@mongodb-headless.${ns}.svc.cluster.local/${db}?authSource=admin" \
+      --quiet --eval "db.getCollectionNames().forEach(c => { const count = db[c].estimatedDocumentCount(); print(c + '  (' + count + ')') })" 2>/dev/null \
+      | fzf --header="$ns / $db — select collection" --height=20 --no-info \
+      | awk '{print $1}') || return 0
+  fi
+
+  # Browse documents
+  local db_uri="mongodb://gc_mgmt:${mongo_pass}@mongodb-headless.${ns}.svc.cluster.local/${db}?authSource=admin"
+  while true; do
+    local action
+    action=$(printf "browse first 20\nbrowse all\ncount\nquery (custom filter)\nexit" | fzf \
+      --header="$ns / $db / $coll" --height=10 --no-info) || break
+
+    case "$action" in
+      "browse first 20")
+        kubectl exec "$pod" -- mongosh "$db_uri" --quiet \
+          --eval "db['$coll'].find().limit(20).forEach(d => print(JSON.stringify(d)))" 2>/dev/null \
+          | jq -C '.' | less -R
+        ;;
+      "browse all")
+        kubectl exec "$pod" -- mongosh "$db_uri" --quiet \
+          --eval "db['$coll'].find().forEach(d => print(JSON.stringify(d)))" 2>/dev/null \
+          | jq -C '.' | less -R
+        ;;
+      count)
+        kubectl exec "$pod" -- mongosh "$db_uri" --quiet \
+          --eval "print(db['$coll'].countDocuments())" 2>/dev/null
+        ;;
+      "query (custom filter)")
+        # Fetch a sample doc to show fields + values
+        local sample
+        sample=$(kubectl exec "$pod" -- mongosh "$db_uri" --quiet \
+          --eval "print(JSON.stringify(db['$coll'].findOne()))" 2>/dev/null \
+          | grep '^{')
+
+        local conditions=()
+        while true; do
+          # Pick a field from the sample doc, preview shows full sample
+          local field_line
+          field_line=$(echo "$sample" | jq -r 'to_entries[] | "\(.key)\t\(.value)"' 2>/dev/null \
+            | fzf \
+              --header="$ns/$db/$coll — pick field to filter on (Esc to finish)" \
+              --prompt="field> " \
+              --preview="echo '${conditions[*]:+Filter so far: {}${conditions[*]}}'; echo '$sample' | jq -C '.'" \
+              --preview-window=right:55%:wrap \
+              --delimiter='\t' \
+              --with-nth=1) || break
+
+          [[ -z "$field_line" ]] && break
+          local field
+          field=$(echo "$field_line" | cut -f1)
+          local sample_val
+          sample_val=$(echo "$field_line" | cut -f2)
+
+          # Fetch distinct values for this field (up to 15)
+          local distinct_vals
+          distinct_vals=$(kubectl exec "$pod" -- mongosh "$db_uri" --quiet \
+            --eval "db['$coll'].distinct('$field').slice(0,15).forEach(v => print(JSON.stringify(v)))" 2>/dev/null)
+
+          local value
+          value=$(echo "$distinct_vals" | fzf \
+            --header="$field — pick a value (sample: $sample_val) or type custom" \
+            --prompt="value> " \
+            --print-query \
+            --preview="echo 'Will add: { $field: {} }'" \
+            --preview-window=down:2 \
+            --height=15) || continue
+
+          # --print-query: first line = typed query, second = selection
+          local typed_val selected_val
+          typed_val=$(echo "$value" | head -1)
+          selected_val=$(echo "$value" | tail -1)
+          local chosen_val="${selected_val:-$typed_val}"
+          [[ -z "$chosen_val" ]] && continue
+
+          # Strip surrounding quotes if it's a plain string from distinct
+          local mongo_val="$chosen_val"
+          conditions+=("\"$field\": $mongo_val")
+        done
+
+        [[ ${#conditions[@]} -eq 0 ]] && continue
+
+        local filter="{$(IFS=','; echo "${conditions[*]}")}"
+        echo "Running: db['$coll'].find($filter).limit(20)"
+        kubectl exec "$pod" -- mongosh "$db_uri" --quiet \
+          --eval "db['$coll'].find(${filter}).limit(20).forEach(d => print(JSON.stringify(d)))" 2>/dev/null \
+          | jq -C '.' | less -R
+        ;;
+      exit) break ;;
+    esac
+  done
 }
