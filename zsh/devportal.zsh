@@ -6,6 +6,18 @@
 _DP="devportal-cli"
 _GC_DIR="$HOME/Documents/guardicore"
 _TELEPORT_PROXY="teleport.saas.guardicore.com:443"
+_DEVPORTAL_ZSH="${(%):-%N}"
+_DP_REALMS_DB="$HOME/.local/share/surface/dp-realms.db"
+
+# add repo bin/ to PATH so dp-preview, dp-realm-refresh etc. are available
+path+="$HOME/Documents/surface/bin"
+
+# standard fzf color theme for all dp-* pickers
+_DP_FZF_COLORS=(
+  --color='header:italic:246,prompt:cyan,pointer:bright-yellow'
+  --color='marker:bright-green,spinner:cyan,info:246'
+  --color='hl:yellow,hl+:bright-yellow,border:238'
+)
 
 # ── internal: strip devportal-cli preamble lines, return only JSON ───────────
 _dp_json() {
@@ -19,54 +31,171 @@ for i, c in enumerate(raw):
 "
 }
 
-# ── internal: format realms for fzf ─────────────────────────────────────────
-_dp_realm_lines() {
-  "$_DP" realms list --json 2>/dev/null | _dp_json | python3 -c "
+# ── internal: realms cache ────────────────────────────────────────────────────
+_dp_realms_db_init() {
+  mkdir -p "$(dirname "$_DP_REALMS_DB")"
+  sqlite3 "$_DP_REALMS_DB" "
+    CREATE TABLE IF NOT EXISTS cache      (data TEXT, saved_at INTEGER);
+    CREATE TABLE IF NOT EXISTS realm_data (id TEXT PRIMARY KEY, data TEXT, saved_at INTEGER);
+  " 2>/dev/null
+}
+
+_dp_realms_cache_save() {
+  local data
+  data=$(cat)   # consume piped stdin before calling python
+  _dp_realms_db_init
+  _DP_REALMS_JSON="$data" _DP_REALMS_TS="$(date +%s)" \
+  python3 -c "
+import os, json, sqlite3
+db   = os.path.expanduser('~/.local/share/surface/dp-realms.db')
+raw  = os.environ['_DP_REALMS_JSON']
+ts   = int(os.environ['_DP_REALMS_TS'])
+with sqlite3.connect(db) as conn:
+    # save full list
+    conn.execute('DELETE FROM cache')
+    conn.execute('INSERT INTO cache (data, saved_at) VALUES (?,?)', (raw, ts))
+    # save each realm individually
+    try:
+        realms = json.loads(raw, strict=False)
+        for r in realms:
+            conn.execute(
+                'INSERT OR REPLACE INTO realm_data (id, data, saved_at) VALUES (?,?,?)',
+                (r['id'], json.dumps(r), ts)
+            )
+    except Exception:
+        pass
+"
+}
+
+# ── internal: get a single realm JSON — cache first, live on miss ─────────────
+_dp_realm_get_cached() {
+  local id="$1"
+  _DP_REALM_ID="$id" python3 -c "
+import os, json, sqlite3, subprocess, sys
+
+db  = os.path.expanduser('~/.local/share/surface/dp-realms.db')
+rid = os.environ['_DP_REALM_ID']
+
+# check cache
+try:
+    with sqlite3.connect(db) as conn:
+        row = conn.execute('SELECT data FROM realm_data WHERE id=?', (rid,)).fetchone()
+        if row:
+            print(row[0])
+            sys.exit(0)
+except Exception:
+    pass
+
+# cache miss — fetch live and save
+dp = os.path.expanduser('~/.local/bin/devportal-cli')
+r  = subprocess.run([dp, 'realms', 'get', rid, '--json'], capture_output=True, text=True)
+raw = r.stdout
+for i, c in enumerate(raw):
+    if c in '[{':
+        raw = raw[i:]
+        break
+if not raw.strip():
+    sys.exit(1)
+try:
+    import time
+    with sqlite3.connect(db) as conn:
+        conn.execute('CREATE TABLE IF NOT EXISTS realm_data (id TEXT PRIMARY KEY, data TEXT, saved_at INTEGER)')
+        conn.execute('INSERT OR REPLACE INTO realm_data (id, data, saved_at) VALUES (?,?,?)',
+                     (rid, raw.strip(), int(time.time())))
+except Exception:
+    pass
+print(raw.strip())
+"
+}
+
+_dp_realms_cache_load() {
+  sqlite3 "$_DP_REALMS_DB" "SELECT data FROM cache LIMIT 1;" 2>/dev/null
+}
+
+_dp_realms_cache_age() {
+  local saved_at now diff
+  saved_at=$(sqlite3 "$_DP_REALMS_DB" "SELECT saved_at FROM cache LIMIT 1;" 2>/dev/null)
+  [[ -z "$saved_at" ]] && return 1
+  now=$(date +%s)
+  diff=$(( now - saved_at ))
+  if   (( diff <    60 )); then echo "${diff}s ago"
+  elif (( diff <  3600 )); then echo "$((diff/60))m ago"
+  elif (( diff < 86400 )); then echo "$((diff/3600))h ago"
+  else                          echo "$((diff/86400))d ago"
+  fi
+}
+
+# ── internal: format realm JSON (stdin) → fzf lines ──────────────────────────
+_dp_realm_format() {
+  python3 -c "
 import json, sys, datetime
 
-def expiry(s):
-    if not s: return 'no-expiry'
+BOLD   = '\033[1m';  DIM  = '\033[2m';  RESET  = '\033[0m'
+RED    = '\033[31m'; GRN  = '\033[32m'; YLW    = '\033[33m'
+CYAN   = '\033[36m'; BRED = '\033[91m'; BYLW   = '\033[93m'
+
+def expiry_colored(s):
+    if not s: return DIM + 'no-expiry' + RESET, -1
     d = datetime.datetime.fromisoformat(s.replace('Z', '+00:00'))
     now = datetime.datetime.now(datetime.timezone.utc)
-    delta = d - now
-    days = delta.days
-    if days < 0:   return 'EXPIRED'
-    if days == 0:  return 'today'
-    if days == 1:  return '1d'
-    return f'{days}d'
+    days = (d - now).days
+    if days < 0:   label = 'EXPIRED'; color = BRED + BOLD
+    elif days == 0: label = 'today';  color = BRED
+    elif days == 1: label = '1d';     color = RED
+    elif days <= 4: label = f'{days}d'; color = YLW
+    elif days <= 7: label = f'{days}d'; color = BYLW
+    else:           label = f'{days}d'; color = GRN
+    return color + label + RESET, days
 
 def realm_info(r):
-    qd, version, git_ref, commit, ui_dns = {}, '', '', '', ''
+    version = git_ref = commit = ui_dns = ''
     for res in r.get('resources', []):
         d = res.get('details') or {}
         if res.get('type') == 'kube-deployment':
-            try:
-                qd = json.loads(d.get('queryDetails') or '{}')
-            except Exception:
-                qd = {}
+            try: qd = json.loads(d.get('queryDetails') or '{}')
+            except: qd = {}
             v = qd.get('versioning') or {}
-            if v.get('major'):
-                version = f\"v{v['major']}.{v['minor']}\"
+            if v.get('major'): version = f\"v{v['major']}.{v['minor']}\"
             ui_dns = qd.get('ui_dns_record', '')
-    # most recent deploy request
     for req in r.get('requests', []):
         data = req.get('data') or {}
         if data.get('git_ref'):
-            git_ref = data['git_ref']
-            commit  = (data.get('commit_hash') or '')[:7]
-            break
+            git_ref = data['git_ref']; commit = (data.get('commit_hash') or '')[:7]; break
     return version, git_ref, commit, ui_dns
 
-data = json.load(sys.stdin)
+data = json.loads(sys.stdin.read(), strict=False)
 data.sort(key=lambda r: r.get('updated_at') or '', reverse=True)
 for r in data:
-    exp              = expiry(r.get('expired_at'))
-    name             = r.get('name') or r['id'][:8]
+    exp_str, _   = expiry_colored(r.get('expired_at'))
+    name         = r.get('name') or r['id'][:8]
     version, git_ref, commit, ui_dns = realm_info(r)
-    ver_str  = version if version else '?'
-    ref_str  = git_ref if git_ref else '?'
-    print(f\"{r['id']}|{name:<38} {ver_str:<8} [{ref_str}@{commit}]  exp:{exp:<6}  {ui_dns}\")
+    ver_pad  = f'{(version or \"?\"):<8}'
+    ref_pad  = git_ref or '?'
+    print(f\"{r['id']}|{BOLD}{name:<38}{RESET} {CYAN}{ver_pad}{RESET} {DIM}[{YLW}{ref_pad}{RESET}{DIM}@{commit}]{RESET}  exp:{exp_str:<6}  {DIM}{ui_dns}{RESET}\")
 "
+}
+
+# ── internal: format realms for fzf — uses cache, fetches if none ─────────────
+_dp_realm_lines() {
+  local cached
+  cached=$(_dp_realms_cache_load)
+  if [[ -n "$cached" ]]; then
+    echo "$cached" | _dp_realm_format
+  else
+    _dp_realm_lines_fresh
+  fi
+}
+
+# ── internal: always fetch fresh realms, save cache, output fzf lines ─────────
+_dp_realm_lines_fresh() {
+  local data
+  data=$("$_DP" realms list --json 2>/dev/null | _dp_json)
+  if [[ -z "$data" ]]; then
+    echo "Error: could not fetch realms" >&2
+    return 1
+  fi
+  echo "$data" | _dp_realms_cache_save
+  echo "$data" | _dp_realm_format
 }
 
 # ── internal: format legacy envs for fzf ────────────────────────────────────
@@ -85,18 +214,42 @@ def expiry(s):
     if days == 1:  return '1d'
     return f'{days}d'
 
+BOLD = '\033[1m'; DIM = '\033[2m'; RESET = '\033[0m'
+RED  = '\033[31m'; GRN = '\033[32m'; YLW = '\033[33m'
+BRED = '\033[91m'; BYLW = '\033[93m'; CYAN = '\033[36m'
+
+def expiry_colored(s):
+    if not s: return DIM + 'no-expiry' + RESET
+    d = datetime.datetime.fromisoformat(s.replace('Z', '+00:00'))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    days = (d - now).days
+    if days < 0:    return BRED + BOLD + 'EXPIRED' + RESET
+    if days == 0:   return BRED + 'today' + RESET
+    if days == 1:   return RED  + '1d' + RESET
+    if days <= 4:   return YLW  + f'{days}d' + RESET
+    if days <= 7:   return BYLW + f'{days}d' + RESET
+    return GRN + f'{days}d' + RESET
+
 data = json.load(sys.stdin)
 for e in data:
-    types = '+'.join(sorted(set(x.get('type','?') for x in e.get('resources', []))))
-    exp   = expiry(e.get('expired_at'))
+    types = DIM + '+'.join(sorted(set(x.get('type','?') for x in e.get('resources', [])))) + RESET
+    exp   = expiry_colored(e.get('expired_at'))
     name  = e.get('name') or e['id'][:8]
-    print(f\"{e['id']}|{name:<40} exp:{exp:<8} [{types}]\")
+    print(f\"{e['id']}|{BOLD}{name:<40}{RESET} exp:{exp:<8}  {types}\")
 "
 }
 
 # ── internal: fzf picker returning ID ────────────────────────────────────────
 _dp_pick_realm() {
-  local header="${1:-Select realm}"
+  local title="${1:-Select realm}"
+  local age header
+  age=$(_dp_realms_cache_age 2>/dev/null)
+  if [[ -n "$age" ]]; then
+    header="$title  [cached $age · Ctrl-R / Alt-R to refresh]"
+  else
+    header="$title  [live · Ctrl-R / Alt-R to refresh]"
+  fi
+  local _refresh_bind="change-header($title  [⟳ Refreshing…])+reload(dp-realm-refresh)+change-header($title  [✓ Refreshed · Ctrl-R / Alt-R to refresh again])"
   local line
   line=$(_dp_realm_lines | fzf \
     --delimiter='|' \
@@ -104,7 +257,9 @@ _dp_pick_realm() {
     --header="$header" \
     --preview="dp-preview realm \$(echo {} | cut -d'|' -f1)" \
     --preview-window=right:55%:wrap:border-left \
-    --ansi)
+    --bind="alt-r:$_refresh_bind" \
+    --bind="ctrl-r:$_refresh_bind" \
+    --ansi "${_DP_FZF_COLORS[@]}")
   [[ -z "$line" ]] && return 1
   echo "$line" | cut -d'|' -f1
 }
@@ -118,7 +273,7 @@ _dp_pick_env() {
     --header="$header" \
     --preview="dp-preview env \$(echo {} | cut -d'|' -f1)" \
     --preview-window=right:55%:wrap:border-left \
-    --ansi)
+    --ansi "${_DP_FZF_COLORS[@]}")
   [[ -z "$line" ]] && return 1
   echo "$line" | cut -d'|' -f1
 }
@@ -126,22 +281,42 @@ _dp_pick_env() {
 # ── dp-realms — list / browse realms ─────────────────────────────────────────
 dp-realms() {
   if [[ "$1" == "--help" ]]; then
-    echo "  dp-realms          List all your realms (fzf browser)"
+    echo "  dp-realms          List all your realms (fzf browser, cached)"
     echo "  dp-realms --raw    Print raw table from devportal-cli"
+    echo "  dp-realms --fresh  Bypass cache and fetch live"
     return
   fi
   if [[ "$1" == "--raw" ]]; then
     "$_DP" realms list
     return
   fi
-  _dp_realm_lines | fzf \
+
+  local age header
+  if [[ "$1" == "--fresh" ]]; then
+    header="Realms  [fetching live…]  ·  Ctrl-R / Alt-R to refresh  ·  Enter to view"
+  else
+    age=$(_dp_realms_cache_age 2>/dev/null)
+    if [[ -n "$age" ]]; then
+      header="Realms  [cached $age]  ·  Ctrl-R / Alt-R to refresh  ·  Enter to view"
+    else
+      header="Realms  [live]  ·  Ctrl-R / Alt-R to refresh  ·  Enter to view"
+    fi
+  fi
+
+  local load_cmd
+  [[ "$1" == "--fresh" ]] && load_cmd="_dp_realm_lines_fresh" || load_cmd="_dp_realm_lines"
+
+  local _refresh_bind="change-header(Realms  [⟳ Refreshing…]  ·  Enter to view)+reload(dp-realm-refresh)+change-header(Realms  [✓ Refreshed]  ·  Ctrl-R / Alt-R to refresh  ·  Enter to view)"
+  eval "$load_cmd" | fzf \
     --delimiter='|' \
     --with-nth=2 \
-    --header="Realms (Enter to view details, Ctrl-C to exit)" \
+    --header="$header" \
     --preview="dp-preview realm \$(echo {} | cut -d'|' -f1)" \
     --preview-window=right:55%:wrap:border-left \
     --bind="enter:execute(dp-preview realm \$(echo {} | cut -d'|' -f1) | less)" \
-    --ansi
+    --bind="alt-r:$_refresh_bind" \
+    --bind="ctrl-r:$_refresh_bind" \
+    --ansi "${_DP_FZF_COLORS[@]}"
 }
 
 # ── dp-envs — list / browse legacy envs ──────────────────────────────────────
@@ -370,9 +545,9 @@ dp-open() {
 
   id=$(echo "$line" | cut -d'|' -f1)
 
-  ui_url=$("$_DP" realms get "$id" --json 2>/dev/null | _dp_json | python3 -c "
+  ui_url=$(_dp_realm_get_cached "$id" | python3 -c "
 import json, sys
-data = json.load(sys.stdin)
+data = json.loads(sys.stdin.read(), strict=False)
 for r in data.get('resources', []):
     d = r.get('details') or {}
     if isinstance(d, dict) and d.get('ui_dns_record'):
@@ -444,7 +619,7 @@ dp-info() {
   local realm_id
   realm_id=$(_dp_pick_realm "Show deployment info") || return 1
 
-  "$_DP" realms get "$realm_id" --json 2>/dev/null | _dp_json | python3 -c "
+  _dp_realm_get_cached "$realm_id" | python3 -c "
 import json, sys, datetime
 
 def expiry(s):
@@ -457,7 +632,7 @@ def expiry(s):
     if days == 0:  return 'expires today'
     return f'expires in {days}d ({d.strftime(\"%Y-%m-%d\")})'
 
-r = json.load(sys.stdin)
+r = json.loads(sys.stdin.read(), strict=False)
 name = r.get('name', '?')
 rid  = r.get('id', '?')
 exp  = expiry(r.get('expired_at'))
@@ -552,10 +727,10 @@ if deploys:
 # ── internal: extract cluster + namespace from a realm ID ─────────────────────
 _dp_realm_kube_info() {
   local realm_id="$1"
-  "$_DP" realms get "$realm_id" --json 2>/dev/null | _dp_json | python3 -c "
+  _dp_realm_get_cached "$realm_id" | python3 -c "
 import json, sys
 
-data = json.load(sys.stdin)
+data = json.loads(sys.stdin.read(), strict=False)
 for r in data.get('resources', []):
     if r.get('type') != 'kube-deployment':
         continue
@@ -655,18 +830,28 @@ _DP_SERVICES=(
 
 dp-dev() {
   if [[ "$1" == "--help" ]]; then
-    echo "  dp-dev              Pick services to sync with devspace dev"
+    echo "  dp-dev              Pick realm → pick services → start devspace dev"
     echo "  dp-dev rest-server  Start devspace dev for a specific service directly"
     return
   fi
 
+  # 1. Ensure connected to a realm
+  _dp_ff_pick_env || return 1
+
+  local ns
+  ns=$(kubectl config view --minify -o jsonpath='{..namespace}' 2>/dev/null)
+  echo ""
+  echo "  Namespace: $ns"
+  echo ""
+
+  # 2. Pick services (or use args)
   local services=("$@")
 
   if [[ ${#services[@]} -eq 0 ]]; then
     local picked
     picked=$(printf '%s\n' "${_DP_SERVICES[@]}" | fzf \
       --multi \
-      --header="Select services for devspace dev (Tab to multi-select)") || return 1
+      --header="$ns — select services (Tab to multi-select)") || return 1
     services=(${(f)picked})
   fi
 
