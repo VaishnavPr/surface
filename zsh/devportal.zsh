@@ -688,31 +688,27 @@ _dp_mgmtctl_exec() {
   fi
   kubectl exec "$pod" -- bash -c \
     "cd /var/lib/guardicore/management && python scripts/mgmtctl/main.pyc $* 2>&1" \
-    | grep -vE 'Initializing STATSD|Using STATSD|Initializing logger|Creating a new Consul|\[.*:INFO\]|\[.*:ERROR\]|\[.*:WARNING\]|^\s*$'
+    | grep -vE 'Initializing STATSD|Using STATSD|Initializing logger|Creating a new Consul|\[.*:INFO\]|\[.*:ERROR\]|\[.*:WARNING\]|^(WARNING|ERROR|INFO|DEBUG):[^:]+:|^\s*$'
 }
 
-_DP_FF_CACHE="$HOME/.local/share/surface/dp-ff"
+_DP_FF_DB="$HOME/.local/share/surface/dp-ff.db"
 
-_dp_ff_pick_env() {
-  local current_ns current_ctx
-  current_ns=$(kubectl config view --minify -o jsonpath='{..namespace}' 2>/dev/null)
-  current_ctx=$(kubectl config current-context 2>/dev/null | sed 's/.*\///')
-
-  local choice
-  choice=$(printf "Use current env  [${current_ns:-none}]\nPick a different realm" | fzf \
-    --header="  ctx: ${current_ctx:-?}   ns: ${current_ns:-not connected}" \
-    --height=7 --no-info) || return 1
-
-  [[ "$choice" == "Pick a different realm" ]] && { dp-connect || return 1; }
+_dp_ff_db_init() {
+  sqlite3 "$_DP_FF_DB" "
+    CREATE TABLE IF NOT EXISTS cache (
+      namespace TEXT PRIMARY KEY,
+      conf      TEXT,
+      ff        TEXT,
+      saved_at  INTEGER
+    );"
 }
 
 _dp_ff_cache_age() {
-  local ts_file="$_DP_FF_CACHE/$1/timestamp"
-  [[ -f "$ts_file" ]] || return 1
-  local ts now diff
-  ts=$(cat "$ts_file")
+  local saved_at now diff
+  saved_at=$(sqlite3 "$_DP_FF_DB" "SELECT saved_at FROM cache WHERE namespace='$1';" 2>/dev/null)
+  [[ -z "$saved_at" ]] && return 1
   now=$(date +%s)
-  diff=$(( now - ts ))
+  diff=$(( now - saved_at ))
   if   (( diff <    60 )); then echo "${diff}s ago"
   elif (( diff <  3600 )); then echo "$((diff/60))m ago"
   elif (( diff < 86400 )); then echo "$((diff/3600))h ago"
@@ -722,20 +718,24 @@ _dp_ff_cache_age() {
 
 _dp_ff_cache_save() {
   local ns="$1"
-  local dir="$_DP_FF_CACHE/$ns"
-  mkdir -p "$dir"
-  printf '%s' "$2" > "$dir/conf.txt"
-  printf '%s' "$3" > "$dir/ff.json"
-  date +%s          > "$dir/timestamp"
+  _dp_ff_db_init
+  _DP_FF_CONF="$2" _DP_FF_FF="$3" python3 - "$_DP_FF_DB" "$ns" "$(date +%s)" <<'PYEOF'
+import sys, sqlite3, os
+db, ns, ts = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with sqlite3.connect(db) as conn:
+    conn.execute(
+        "INSERT OR REPLACE INTO cache (namespace, conf, ff, saved_at) VALUES (?,?,?,?)",
+        (ns, os.environ['_DP_FF_CONF'], os.environ['_DP_FF_FF'], ts))
+PYEOF
+  echo "  [cache] saved to db for $ns"
 }
 
 _dp_ff_cache_bust() {
-  local ns="$1"
-  rm -f "$_DP_FF_CACHE/$ns/timestamp"
+  sqlite3 "$_DP_FF_DB" "DELETE FROM cache WHERE namespace='$1';" 2>/dev/null
 }
 
 _dp_ff_fetch() {
-  # Sets conf_raw and ff_raw in caller's scope; saves to cache
+  # Populates conf_raw and ff_raw in caller scope; saves cache
   local ns="$1"
   echo "Fetching conf + feature flags from cluster..."
   conf_raw=$(_dp_mgmtctl_exec "dump_conf" 2>/dev/null)
@@ -745,78 +745,57 @@ _dp_ff_fetch() {
     return 1
   fi
   _dp_ff_cache_save "$ns" "$conf_raw" "$ff_raw"
-  echo "Cached for $ns."
 }
 
-_dp_ff_ask_cache() {
-  # Sets conf_raw and ff_raw in caller's scope using cache or fetch
-  local ns="$1"
-  local dir="$_DP_FF_CACHE/$ns"
-
-  if [[ -f "$dir/timestamp" ]]; then
-    local age
-    age=$(_dp_ff_cache_age "$ns")
-    local choice
+_dp_ff_load() {
+  # Populates conf_raw and ff_raw in caller scope; prompts to use cache or fetch fresh
+  local ns="$1" age choice row
+  _dp_ff_db_init
+  age=$(_dp_ff_cache_age "$ns")
+  if [[ -n "$age" ]]; then
     choice=$(printf "Use cached  [$age]\nFetch fresh from cluster" | fzf \
       --header="  ns: $ns" \
       --height=6 --no-info) || return 1
-
     if [[ "$choice" == Use\ cached* ]]; then
-      conf_raw=$(cat "$dir/conf.txt")
-      ff_raw=$(cat "$dir/ff.json")
+      conf_raw=$(python3 -c "import sys,sqlite3; r=sqlite3.connect(sys.argv[1]).execute('SELECT conf FROM cache WHERE namespace=?',(sys.argv[2],)).fetchone(); print(r[0] if r else '',end='')" "$_DP_FF_DB" "$ns")
+      ff_raw=$(python3   -c "import sys,sqlite3; r=sqlite3.connect(sys.argv[1]).execute('SELECT ff FROM cache WHERE namespace=?',(sys.argv[2],)).fetchone(); print(r[0] if r else '',end='')" "$_DP_FF_DB" "$ns")
       echo "Using cache ($age)."
       return 0
     fi
   fi
-
   _dp_ff_fetch "$ns"
 }
 
-_dp_ff_build_lines() {
-  python3 -c "
-import json, sys, re
+_dp_ff_pick_env() {
+  local current_ns current_ctx
+  current_ns=$(kubectl config view --minify -o jsonpath='{..namespace}' 2>/dev/null)
+  current_ctx=$(kubectl config current-context 2>/dev/null | sed 's/.*\///')
 
-RED    = '\033[31m'
-GREEN  = '\033[32m'
-YELLOW = '\033[33m'
-DIM    = '\033[2m'
-RESET  = '\033[0m'
+  echo ""
+  if [[ -n "$current_ns" ]]; then
+    echo "  Current env:  ctx=${current_ctx}  ns=${current_ns}"
+  else
+    echo "  Current env:  (not connected)"
+  fi
+  echo ""
 
-conf_raw, ff_raw = sys.argv[1], sys.argv[2]
+  local choice
+  choice=$(printf "Use current env  [${current_ns:-none}]\nPick a different realm" | fzf \
+    --header="Which environment?" \
+    --height=6 \
+    --no-info) || return 1
 
-def color_val(v):
-    vs = str(v)
-    if vs.lower() == 'true':  return GREEN  + vs + RESET
-    if vs.lower() == 'false': return RED    + vs + RESET
-    return YELLOW + vs + RESET
-
-lines = []
-
-# conf (INI)
-current_group = ''
-for line in conf_raw.splitlines():
-    m = re.match(r'^\[(.+)\]', line)
-    if m: current_group = m.group(1); continue
-    m = re.match(r'^(\S+)\s*=\s*(.+)', line)
-    if m and current_group:
-        opt, val = m.group(1), m.group(2).strip()
-        disp = f'{DIM}[conf]{RESET}  {current_group:<22} {opt:<42} = {color_val(val)}'
-        lines.append(f'conf|{current_group}|{opt}|{val}|{disp}')
-
-# feature flags (JSON)
-if ff_raw:
-    try:
-        start = ff_raw.index('{')
-        data = json.loads(ff_raw[start:])
-        for group, opts in sorted(data.items()):
-            if not isinstance(opts, dict): continue
-            for opt, val in sorted(opts.items()):
-                disp = f'{DIM}[ff]  {RESET}  {group:<22} {opt:<42} = {color_val(val)}'
-                lines.append(f'ff|{group}|{opt}|{val}|{disp}')
-    except: pass
-
-print('\n'.join(lines))
-" "$1" "$2"
+  if [[ "$choice" == "Pick a different realm" ]]; then
+    dp-connect || return 1
+  else
+    # Verify kubectl is reachable; Teleport tokens expire so refresh if needed
+    if ! kubectl get pods --no-headers 2>/dev/null | grep -q .; then
+      echo "  kube connection stale — refreshing..."
+      local proxy_base="${_TELEPORT_PROXY%%:*}"
+      local cluster="${current_ctx#${proxy_base}-}"
+      tsh kube login "$cluster" || return 1
+    fi
+  fi
 }
 
 # ── dp-ff — feature flag + conf browser for SaaS devportal realms ───────────
@@ -863,7 +842,7 @@ dp-ff() {
       _dp_ff_pick_env || return 1
       local ns conf_raw ff_raw
       ns=$(kubectl config view --minify -o jsonpath='{..namespace}' 2>/dev/null)
-      _dp_ff_ask_cache "$ns" || return 1
+      _dp_ff_load "$ns" || return 1
       echo "=== conf ===" && echo "$conf_raw"
       echo "" && echo "=== feature flags ===" && echo "$ff_raw"
       ;;
@@ -875,10 +854,60 @@ dp-ff() {
       ns=$(kubectl config view --minify -o jsonpath='{..namespace}' 2>/dev/null)
 
       local conf_raw ff_raw
-      _dp_ff_ask_cache "$ns" || return 1
+      _dp_ff_load "$ns" || return 1
+
+      if [[ -z "$conf_raw" && -z "$ff_raw" ]]; then
+        echo "No output — is the namespace connected? (run dp-connect first)" >&2
+        return 1
+      fi
 
       local lines
-      lines=$(_dp_ff_build_lines "$conf_raw" "$ff_raw")
+      lines=$(python3 -c "
+import json, sys, re
+
+RED    = '\033[31m'
+GREEN  = '\033[32m'
+YELLOW = '\033[33m'
+DIM    = '\033[2m'
+RESET  = '\033[0m'
+
+conf_raw = sys.argv[1]
+ff_raw   = sys.argv[2]
+
+def color_val(v):
+    vs = str(v)
+    if vs.lower() == 'true':  return GREEN  + vs + RESET
+    if vs.lower() == 'false': return RED    + vs + RESET
+    return YELLOW + vs + RESET
+
+lines = []
+
+# conf (INI)
+current_group = ''
+for line in conf_raw.splitlines():
+    m = re.match(r'^\[(.+)\]', line)
+    if m: current_group = m.group(1); continue
+    m = re.match(r'^(\S+)\s*=\s*(.+)', line)
+    if m and current_group:
+        opt, val = m.group(1), m.group(2).strip()
+        disp = f'{DIM}[conf]{RESET}  {current_group:<22} {opt:<42} = {color_val(val)}'
+        lines.append(f'conf|{current_group}|{opt}|{val}|{disp}')
+
+# feature flags (JSON)
+if ff_raw:
+    try:
+        start = ff_raw.index('{')
+        data = json.loads(ff_raw[start:])
+        for group, opts in sorted(data.items()):
+            if not isinstance(opts, dict): continue
+            for opt, val in sorted(opts.items()):
+                disp = f'{DIM}[ff]  {RESET}  {group:<22} {opt:<42} = {color_val(val)}'
+                lines.append(f'ff|{group}|{opt}|{val}|{disp}')
+    except: pass
+
+print('\n'.join(lines))
+" "$conf_raw" "$ff_raw")
+
       [[ -z "$lines" ]] && echo "Could not parse output." && return 1
 
       local selected
@@ -887,7 +916,7 @@ dp-ff() {
         --with-nth=5 \
         --ansi \
         --header="$ns — conf + feature flags  (Enter to set, Ctrl-C to exit)" \
-        --preview='printf "type:   {1}\ngroup:  {2}\noption: {3}\nvalue:  {4}"' \
+        --preview='echo "type:   {1}\ngroup:  {2}\noption: {3}\nvalue:  {4}"' \
         --preview-window=down:6:wrap) || return 0
 
       local ftype group option current_val
@@ -913,9 +942,12 @@ dp-ff() {
       [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "Aborted." && return 0
 
       echo "Setting..."
-      _dp_mgmtctl_exec "set_conf --group $group --option $option --value $new_val" || return 1
+      if [[ "$ftype" == "ff" ]]; then
+        _dp_mgmtctl_exec "set_ff --feature_flag_name ${group}.${option} --value ${new_val:l}" || return 1
+      else
+        _dp_mgmtctl_exec "set_conf --group $group --option $option --value $new_val" || return 1
+      fi
 
-      # Update cache: bust and re-fetch so next open reflects the change
       echo "Refreshing cache..."
       _dp_ff_fetch "$ns"
       ;;

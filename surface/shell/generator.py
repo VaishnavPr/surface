@@ -3,6 +3,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+_ZSH_DIR = Path(__file__).parent.parent.parent / "zsh"
+
 SHELL_ZSH = Path.home() / ".local" / "share" / "surface" / "shell.zsh"
 
 _SURFACE_BIN = str(Path(sys.executable).parent / "surface")
@@ -150,6 +152,14 @@ def generate(conn: sqlite3.Connection) -> str:
         "}",
         "",
     ]
+
+    # ── source project zsh files ──────────────────────────────────────────────
+    zsh_files = sorted(_ZSH_DIR.glob("*.zsh"))
+    if zsh_files:
+        lines += ["# ── surface zsh integrations ────────────────────────────────────────"]
+        for f in zsh_files:
+            lines.append(f"[[ -f {f} ]] && source {f}")
+        lines.append("")
 
     return "\n".join(lines) + "\n"
 
