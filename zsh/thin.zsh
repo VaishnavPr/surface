@@ -2,7 +2,9 @@
 # thin — helpers for Guardicore thin env (v1) SSH-based environments
 # Commands: thin-ssh, thin-run, thin-mgmtctl, thin-ff, thin-logs, thin-log-search, thin-status
 
-_THIN_PASS="tisctmt1"
+# load thin config (sets THIN_PASS etc.)
+[[ -f "$HOME/.config/gc-thin.env" ]] && source "$HOME/.config/gc-thin.env"
+_THIN_PASS="${THIN_PASS:-tisctmt1}"
 _THIN_SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes"
 
 # ── internal: port for service ────────────────────────────────────────────────

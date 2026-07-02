@@ -4,13 +4,16 @@
 #           dp-connect, dp-dev, dp-logs, dp-mgmtctl, dp-config-gen
 
 _DP="devportal-cli"
-_GC_DIR="$HOME/Documents/guardicore"
 _TELEPORT_PROXY="teleport.saas.guardicore.com:443"
+
+# load devportal config (sets SURFACE_GC_DIR etc.)
+[[ -f "$HOME/.config/gc-devportal.env" ]] && source "$HOME/.config/gc-devportal.env"
+_GC_DIR="${SURFACE_GC_DIR:-$HOME/Documents/guardicore}"
 _DEVPORTAL_ZSH="${(%):-%N}"
 _DP_REALMS_DB="$HOME/.local/share/surface/dp-realms.db"
 
-# add repo bin/ to PATH so dp-preview, dp-realm-refresh etc. are available
-path+="$HOME/Documents/surface/bin"
+# add repo bin/ to PATH — derived from this file's location, not hardcoded
+path+="${_DEVPORTAL_ZSH:h:h}/bin"
 
 # standard fzf color theme for all dp-* pickers
 _DP_FZF_COLORS=(
@@ -87,7 +90,8 @@ except Exception:
     pass
 
 # cache miss — fetch live and save
-dp = os.path.expanduser('~/.local/bin/devportal-cli')
+import shutil
+dp = shutil.which('devportal-cli') or os.path.expanduser('~/.local/bin/devportal-cli')
 r  = subprocess.run([dp, 'realms', 'get', rid, '--json'], capture_output=True, text=True)
 raw = r.stdout
 for i, c in enumerate(raw):
@@ -249,13 +253,13 @@ _dp_pick_realm() {
   else
     header="$title  [live · Ctrl-R / Alt-R to refresh]"
   fi
-  local _refresh_bind="change-header($title  [⟳ Refreshing…])+reload(dp-realm-refresh)+change-header($title  [✓ Refreshed · Ctrl-R / Alt-R to refresh again])"
+  local _refresh_bind="change-header($title  [⟳ Refreshing…])+reload(dp-realm-refresh.py)+change-header($title  [✓ Refreshed · Ctrl-R / Alt-R to refresh again])"
   local line
   line=$(_dp_realm_lines | fzf \
     --delimiter='|' \
     --with-nth=2 \
     --header="$header" \
-    --preview="dp-preview realm \$(echo {} | cut -d'|' -f1)" \
+    --preview="dp-preview.py realm \$(echo {} | cut -d'|' -f1)" \
     --preview-window=right:55%:wrap:border-left \
     --bind="alt-r:$_refresh_bind" \
     --bind="ctrl-r:$_refresh_bind" \
@@ -271,7 +275,7 @@ _dp_pick_env() {
     --delimiter='|' \
     --with-nth=2 \
     --header="$header" \
-    --preview="dp-preview env \$(echo {} | cut -d'|' -f1)" \
+    --preview="dp-preview.py env \$(echo {} | cut -d'|' -f1)" \
     --preview-window=right:55%:wrap:border-left \
     --ansi "${_DP_FZF_COLORS[@]}")
   [[ -z "$line" ]] && return 1
@@ -306,14 +310,14 @@ dp-realms() {
   local load_cmd
   [[ "$1" == "--fresh" ]] && load_cmd="_dp_realm_lines_fresh" || load_cmd="_dp_realm_lines"
 
-  local _refresh_bind="change-header(Realms  [⟳ Refreshing…]  ·  Enter to view)+reload(dp-realm-refresh)+change-header(Realms  [✓ Refreshed]  ·  Ctrl-R / Alt-R to refresh  ·  Enter to view)"
+  local _refresh_bind="change-header(Realms  [⟳ Refreshing…]  ·  Enter to view)+reload(dp-realm-refresh.py)+change-header(Realms  [✓ Refreshed]  ·  Ctrl-R / Alt-R to refresh  ·  Enter to view)"
   eval "$load_cmd" | fzf \
     --delimiter='|' \
     --with-nth=2 \
     --header="$header" \
-    --preview="dp-preview realm \$(echo {} | cut -d'|' -f1)" \
+    --preview="dp-preview.py realm \$(echo {} | cut -d'|' -f1)" \
     --preview-window=right:55%:wrap:border-left \
-    --bind="enter:execute(dp-preview realm \$(echo {} | cut -d'|' -f1) | less)" \
+    --bind="enter:execute(dp-preview.py realm \$(echo {} | cut -d'|' -f1) | less)" \
     --bind="alt-r:$_refresh_bind" \
     --bind="ctrl-r:$_refresh_bind" \
     --ansi "${_DP_FZF_COLORS[@]}"
@@ -334,9 +338,9 @@ dp-envs() {
     --delimiter='|' \
     --with-nth=2 \
     --header="Legacy envs (Enter to view details, Ctrl-C to exit)" \
-    --preview="dp-preview env \$(echo {} | cut -d'|' -f1)" \
+    --preview="dp-preview.py env \$(echo {} | cut -d'|' -f1)" \
     --preview-window=right:55%:wrap:border-left \
-    --bind="enter:execute(dp-preview env \$(echo {} | cut -d'|' -f1) | less)" \
+    --bind="enter:execute(dp-preview.py env \$(echo {} | cut -d'|' -f1) | less)" \
     --ansi
 }
 
@@ -404,7 +408,7 @@ dp-terminate() {
     line=$(_dp_realm_lines | fzf --delimiter='|' --with-nth=2 \
       --header="TERMINATE realm — pick one" \
       --color=prompt:red \
-      --preview="dp-preview realm \$(echo {} | cut -d'|' -f1)" \
+      --preview="dp-preview.py realm \$(echo {} | cut -d'|' -f1)" \
       --preview-window=right:55%:wrap:border-left) || return 1
     id=$(echo "$line" | cut -d'|' -f1)
     name=$(echo "$line" | cut -d'|' -f2 | xargs)
@@ -418,7 +422,7 @@ dp-terminate() {
     line=$(_dp_env_lines | fzf --delimiter='|' --with-nth=2 \
       --header="TERMINATE legacy env — pick one" \
       --color=prompt:red \
-      --preview="dp-preview env \$(echo {} | cut -d'|' -f1)" \
+      --preview="dp-preview.py env \$(echo {} | cut -d'|' -f1)" \
       --preview-window=right:55%:wrap:border-left) || return 1
     id=$(echo "$line" | cut -d'|' -f1)
     name=$(echo "$line" | cut -d'|' -f2 | xargs)
@@ -540,7 +544,7 @@ dp-open() {
     --delimiter='|' \
     --with-nth=2 \
     --header="Open in browser — pick realm" \
-    --preview="dp-preview realm \$(echo {} | cut -d'|' -f1)" \
+    --preview="dp-preview.py realm \$(echo {} | cut -d'|' -f1)" \
     --preview-window=right:55%:wrap:border-left) || return 1
 
   id=$(echo "$line" | cut -d'|' -f1)

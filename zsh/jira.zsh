@@ -131,10 +131,13 @@ _jira_ai_branch_suggestions() {
 
     [[ -z "$ANTHROPIC_FOUNDRY_API_KEY" || -z "$ANTHROPIC_FOUNDRY_BASE_URL" ]] && return 1
 
+    _jira_load_env || return 1
+    local _user="${JIRA_EMAIL%%@*}"
+
     local prompt="Generate exactly 5 git branch name suggestions for a Jira ticket.
 Ticket: $key
 Summary: $summary
-Format: each must start with vpratap/${key}- followed by a short kebab-case slug.
+Format: each must start with ${_user}/${key}- followed by a short kebab-case slug.
 Rules: lowercase only, hyphens only, max 60 chars total per branch name, no explanation, one branch name per line, nothing else."
 
     local payload=$(jq -n --arg p "$prompt" '{
@@ -147,11 +150,10 @@ Rules: lowercase only, hyphens only, max 60 chars total per branch name, no expl
         -H "Authorization: Bearer $ANTHROPIC_FOUNDRY_API_KEY" \
         -H "anthropic-version: 2023-06-01" \
         -H "Content-Type: application/json" \
-        -H "user-id: vpratap_prod" \
         -d "$payload" \
         "$ANTHROPIC_FOUNDRY_BASE_URL/v1/messages" \
     | jq -r '.content[0].text // ""' \
-    | grep -o "vpratap/${key}-[a-z0-9-]*"
+    | grep -o "${_user}/${key}-[a-z0-9-]*"
 }
 
 # ─── jira-tickets ────────────────────────────────────────────────────────────
@@ -270,7 +272,7 @@ jira-start() {
     if [[ "$1" == "--help" ]]; then
         printf "  ${COLOR_CYAN}jira-start${COLOR_RESET}\n"
         printf "    Pick a ticket and create a git branch for it\n"
-        printf "    ${COLOR_DIM}Branch format: vpratap/GC-XXXXX-slug${COLOR_RESET}\n\n"
+        printf "    ${COLOR_DIM}Branch format: <user>/GC-XXXXX-slug  (user = JIRA_EMAIL prefix)${COLOR_RESET}\n\n"
         return
     fi
 
@@ -312,7 +314,9 @@ jira-start() {
     local ai_suggestions=$(_jira_ai_branch_suggestions "$key" "$summary")
 
     # always include the local slug as a fallback
-    local fallback="vpratap/${key}-$(_jira_slug "$summary")"
+    _jira_load_env 2>/dev/null
+    local _user="${JIRA_EMAIL%%@*}"
+    local fallback="${_user}/${key}-$(_jira_slug "$summary")"
     local all_suggestions=$(printf '%s\n%s\n' "$ai_suggestions" "$fallback" | grep -v '^$' | awk '!seen[$0]++')
 
     # build fzf list: available first, existing last with marker

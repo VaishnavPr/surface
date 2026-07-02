@@ -60,13 +60,26 @@ Each zsh module reads a credentials file from `~/.config/`. Create these files b
 
 ### Jira — `~/.config/gc-jira.env`
 
+Required for all `jira-*` commands:
+
 ```bash
 JIRA_BASE_URL="https://guardicore.atlassian.net"
-JIRA_EMAIL="you@akamai.com"
+JIRA_EMAIL="you@akamai.com"        # also used as git branch prefix (email%%@*)
 JIRA_TOKEN="<Atlassian API token>"
 ```
 
-Get your token at: `https://id.atlassian.com/manage-profile/security/api-tokens`
+Get your token: https://id.atlassian.com/manage-profile/security/api-tokens
+
+**Optional — AI branch suggestions in `jira-start`:**
+
+```bash
+ANTHROPIC_FOUNDRY_API_KEY="<key>"
+ANTHROPIC_FOUNDRY_BASE_URL="<url>"
+```
+
+If unset, `jira-start` skips the AI step and uses a local slug as the branch name. Set these in `~/.zshrc` (not in the env file) since they are also used by Claude Code.
+
+**Tools required:** `curl`, `jq`, `fzf`, `git`
 
 ### Jenkins — `~/.config/gc-jenkins.env`
 
@@ -86,6 +99,22 @@ CIRCLECI_TOKEN="<CircleCI personal API token>"
 ```
 
 Get your token: `https://app.circleci.com/settings/user/tokens`
+
+### Thin envs — `~/.config/gc-thin.env`
+
+```bash
+THIN_PASS="<your thin env root password>"
+```
+
+If this file is absent, the default shared password is used. Set this if your thin envs use a different password.
+
+### Dev portal — `~/.config/gc-devportal.env`
+
+```bash
+SURFACE_GC_DIR="$HOME/Documents/guardicore"   # path to your local guardicore repo clone
+```
+
+Required by `dp-dev`, `dp-logs`, `dp-config-gen` (devspace commands run from this directory).
 
 ### GitHub — `~/.config/gc-github.env`
 
@@ -161,7 +190,7 @@ Requires: `devportal-cli` authenticated, `fzf`, `python3`, `sqlite3`
 dp-realms          Browse all your realms (version, branch, expiry inline)
 dp-envs            Browse legacy (thin) environments
 dp-new             Create a new realm; optionally deploy SaaS Centra to it
-dp-deploy          Deploy SaaS Centra to a realm (fzf pick, or --new to create first)
+dp-deploy          Deploy SaaS Centra to a realm (fzf pick)
 dp-claim           Claim a pre-provisioned instant realm
 dp-info            Full info card — credentials, cluster, versions, deploy history
 dp-connect         Pick realm → tsh login → kubectl namespace set
@@ -170,7 +199,7 @@ dp-terminate       Terminate a realm or legacy env (with confirmation)
 dp-transfer        Transfer ownership of a realm or legacy env
 dp-open            Open realm UI in browser
 dp-requests        Browse recent devportal request history
-dp-dev             devspace dev with fzf service picker
+dp-dev             Pick realm → pick services → start devspace dev
 dp-logs            Tail logs for a service (fzf pick)
 dp-mgmtctl         Run mgmtctl commands inside script-server pod
 dp-ff              Browse & toggle feature flags / conf (cached, interactive)
@@ -178,7 +207,7 @@ dp-config-gen      Generate devspace.yaml for selected services
 dp-mongo           Interactive MongoDB browser (db → collection → documents)
 ```
 
-`dp-connect` requires `tsh` and `kubectl`. `dp-dev`, `dp-logs`, `dp-config-gen` additionally require `devspace` and `uv` (run from `~/Documents/guardicore`).
+`dp-connect` requires `tsh` and `kubectl`. `dp-dev`, `dp-logs`, `dp-config-gen` additionally require `devspace` and `uv` (run from the path set in `SURFACE_GC_DIR`, defaults to `~/Documents/guardicore`).
 
 ### Thin envs (`thin-*`)
 
@@ -194,7 +223,7 @@ thin-mgmtctl <num> <cmd>           Run mgmtctl command on thin-<num>
 thin-status <num>                  Quick health check
 ```
 
-The thin env password is hardcoded in `thin.zsh` (`_THIN_PASS`).
+The default shared password is used if `~/.config/gc-thin.env` is absent. Set `THIN_PASS` there if yours differs.
 
 ### Aggregator (`agg-*`)
 
