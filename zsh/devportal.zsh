@@ -243,6 +243,39 @@ for e in data:
 "
 }
 
+# ── internal: get UI URL for a realm from the list cache ─────────────────────
+# ui_dns_record lives inside details.queryDetails (nested JSON string) in the
+# list API response — not in the per-realm 'get' response
+_dp_realm_ui_url() {
+  local realm_id="$1"
+  _DP_REALM_ID="$realm_id" python3 -c "
+import sqlite3, json, os, sys
+db = os.path.expanduser('~/.local/share/surface/dp-realms.db')
+rid = os.environ['_DP_REALM_ID']
+conn = sqlite3.connect(db)
+row = conn.execute('SELECT data FROM cache LIMIT 1').fetchone()
+if not row:
+    sys.exit(1)
+for item in json.loads(row[0]):
+    if item.get('id') != rid:
+        continue
+    for r in item.get('resources', []):
+        d = r.get('details') or {}
+        qd_raw = d.get('queryDetails', '')
+        if not qd_raw:
+            continue
+        try:
+            qd = json.loads(qd_raw)
+            url = qd.get('ui_dns_record')
+            if url:
+                print('https://' + url)
+                sys.exit(0)
+        except Exception:
+            pass
+sys.exit(1)
+" 2>/dev/null
+}
+
 # ── internal: fzf picker returning ID ────────────────────────────────────────
 _dp_pick_realm() {
   local title="${1:-Select realm}"
@@ -549,15 +582,7 @@ dp-open() {
 
   id=$(echo "$line" | cut -d'|' -f1)
 
-  ui_url=$(_dp_realm_get_cached "$id" | python3 -c "
-import json, sys
-data = json.loads(sys.stdin.read(), strict=False)
-for r in data.get('resources', []):
-    d = r.get('details') or {}
-    if isinstance(d, dict) and d.get('ui_dns_record'):
-        print('https://' + d['ui_dns_record'])
-        break
-")
+  ui_url=$(_dp_realm_ui_url "$id")
 
   if [[ -n "$ui_url" ]]; then
     echo "Opening $ui_url"
@@ -1363,4 +1388,83 @@ print(conf['mongodb_user_passwords']['gc_mgmt'])
       exit) break ;;
     esac
   done
+}
+
+# ── dp-ui — start UI dev servers + mockoon proxy to customer realm ────────────
+_DP_UI_MOCKOON_SRC="$HOME/Documents/surface/data/mockoon-saasv2.json"
+
+dp-ui() {
+  if [[ "$1" == "--help" ]]; then
+    echo "  dp-ui    Start ui/ + ui_v3/ npm dev servers and mockoon proxy"
+    echo "           Picks a customer realm via fzf, proxies all API calls to it"
+    return
+  fi
+
+  local gc_dir="${SURFACE_GC_DIR:-$HOME/Documents/guardicore}"
+
+  local mockoon_src="$_DP_UI_MOCKOON_SRC"
+  if [[ ! -f "$mockoon_src" ]]; then
+    echo "Mockoon template not found: $mockoon_src" >&2
+    return 1
+  fi
+
+  # 1. Pick realm
+  local realm_id
+  realm_id=$(_dp_pick_realm "dp-ui — pick proxy realm") || return 1
+
+  # 2. Get UI URL from the realms list cache (ui_dns_record is in queryDetails)
+  local ui_url
+  ui_url=$(_dp_realm_ui_url "$realm_id")
+
+  if [[ -z "$ui_url" ]]; then
+    echo "No UI URL found for realm $realm_id (may still be deploying)" >&2
+    return 1
+  fi
+
+  echo "  Realm:    $realm_id"
+  echo "  Proxy:    $ui_url"
+  echo ""
+
+  # 3. Patch mockoon JSON with realm URL, clear routes so all traffic proxies
+  local mockoon_tmp="/tmp/dp-ui-mockoon-${realm_id}.json"
+  python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+data['proxyHost'] = sys.argv[2]
+data['routes'] = []
+data['rootChildren'] = []
+with open(sys.argv[3], 'w') as f:
+    json.dump(data, f, indent=2)
+" "$mockoon_src" "$ui_url" "$mockoon_tmp" || {
+    echo "Failed to patch mockoon config" >&2
+    return 1
+  }
+
+  # 4. Start npm dev servers in background
+  local ui_log="/tmp/dp-ui-ui.log"
+  local ui_v3_log="/tmp/dp-ui-ui_v3.log"
+
+  echo "Starting ui/    → log: $ui_log"
+  (cd "$gc_dir/ui" && npm start &>"$ui_log") &
+  local ui_pid=$!
+
+  echo "Starting ui_v3/ → log: $ui_v3_log"
+  (cd "$gc_dir/ui_v3" && npm start &>"$ui_v3_log") &
+  local ui_v3_pid=$!
+
+  echo ""
+  echo "Starting mockoon on :8442 (Ctrl+C stops everything)..."
+  echo ""
+
+  # cleanup on exit
+  trap "echo ''; echo 'Stopping UI servers...'; kill $ui_pid $ui_v3_pid 2>/dev/null; trap - INT TERM EXIT" INT TERM EXIT
+
+  # 5. Start mockoon foreground
+  npx --yes @mockoon/cli start --data "$mockoon_tmp"
+
+  # after mockoon exits normally
+  trap - INT TERM EXIT
+  kill "$ui_pid" "$ui_v3_pid" 2>/dev/null
+  echo "All stopped."
 }
